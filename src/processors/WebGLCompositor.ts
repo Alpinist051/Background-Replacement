@@ -2,9 +2,7 @@ import copyVert from '@/shaders/virtual-background/copy.vert?raw';
 import copyFrag from '@/shaders/virtual-background/copy.frag?raw';
 import backgroundBlurFrag from '@/shaders/background-blur.frag?raw';
 import edgeFeatherFrag from '@/shaders/edge-feather.frag?raw';
-import lightWrappingFrag from '@/shaders/light-wrapping.frag?raw';
 import temporalSmoothFrag from '@/shaders/temporal-smooth.frag?raw';
-import faceCorrectionFrag from '@/shaders/face-correction.frag?raw';
 import type { VirtualBackgroundEffect } from '@/types/video-processing';
 
 export interface FaceBox {
@@ -42,27 +40,25 @@ export class WebGLCompositor {
   private readonly temporalProgram: WebGLProgram;
   private readonly edgeProgram: WebGLProgram;
   private readonly blurProgram: WebGLProgram;
-  private readonly lightProgram: WebGLProgram;
-  private readonly faceProgram: WebGLProgram;
 
   private readonly maskFramebuffer!: WebGLFramebuffer;
-  private readonly blurFramebuffer!: WebGLFramebuffer;
-  private readonly lightFramebuffer!: WebGLFramebuffer;
+  private readonly downsampleFramebuffer!: WebGLFramebuffer;
 
   private videoTexture!: WebGLTexture;
   private backgroundTexture!: WebGLTexture;
+  private blurSourceTexture!: WebGLTexture;
+  private readonly blurSourceWidth: number;
+  private readonly blurSourceHeight: number;
 
   private maskCurrentTex!: WebGLTexture;
   private maskPreviousTex!: WebGLTexture;
   private maskSmoothTex!: WebGLTexture;
   private maskFeatherTex!: WebGLTexture;
 
-  private blurTexture!: WebGLTexture;
-  private lightTexture!: WebGLTexture;
-
   private maskReady = false;
   private faceBox: FaceBox | null = null;
   private backgroundAspect = 1.0;
+  private hasBackgroundImage = false;
 
   constructor(init: WebGLCompositorInit) {
     this.canvas = init.canvas;
@@ -88,23 +84,20 @@ export class WebGLCompositor {
     this.temporalProgram = this.createProgram(temporalSmoothFrag);
     this.edgeProgram = this.createProgram(edgeFeatherFrag);
     this.blurProgram = this.createProgram(backgroundBlurFrag);
-    this.lightProgram = this.createProgram(lightWrappingFrag);
-    this.faceProgram = this.createProgram(faceCorrectionFrag);
 
     this.maskFramebuffer = this.createFramebuffer();
-    this.blurFramebuffer = this.createFramebuffer();
-    this.lightFramebuffer = this.createFramebuffer();
+    this.downsampleFramebuffer = this.createFramebuffer();
 
     this.videoTexture = this.createVideoTexture();
     this.backgroundTexture = this.createBackgroundTexture();
+    this.blurSourceWidth = Math.max(2, Math.round(this.width * 0.45));
+    this.blurSourceHeight = Math.max(2, Math.round(this.height * 0.45));
+    this.blurSourceTexture = this.createRenderTexture(this.blurSourceWidth, this.blurSourceHeight);
 
     this.maskCurrentTex = this.createMaskTexture(this.maskWidth, this.maskHeight);
     this.maskPreviousTex = this.createMaskTexture(this.maskWidth, this.maskHeight);
     this.maskSmoothTex = this.createMaskTexture(this.maskWidth, this.maskHeight);
     this.maskFeatherTex = this.createMaskTexture(this.maskWidth, this.maskHeight);
-
-    this.blurTexture = this.createRenderTexture(this.width, this.height);
-    this.lightTexture = this.createRenderTexture(this.width, this.height);
 
     this.fillBackgroundFallback();
   }
@@ -138,8 +131,10 @@ export class WebGLCompositor {
     if (bitmap) {
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, bitmap);
       this.backgroundAspect = bitmap.width / Math.max(1, bitmap.height);
+      this.hasBackgroundImage = true;
     } else {
       this.fillBackgroundFallback();
+      this.hasBackgroundImage = false;
     }
     gl.bindTexture(gl.TEXTURE_2D, null);
   }
@@ -161,9 +156,10 @@ export class WebGLCompositor {
 
     this.runTemporalSmooth();
     this.runEdgeFeather();
-    this.runBlurPass(options.effect, options.blurStrength);
-    this.runLightWrapping();
-    this.runFaceCorrection();
+    if (options.effect === 'blur') {
+      this.runBlurDownsample();
+    }
+    this.runBlurComposite(options.effect, options.blurStrength);
   }
 
   dispose(): void {
@@ -172,19 +168,15 @@ export class WebGLCompositor {
     gl.deleteProgram(this.temporalProgram);
     gl.deleteProgram(this.edgeProgram);
     gl.deleteProgram(this.blurProgram);
-    gl.deleteProgram(this.lightProgram);
-    gl.deleteProgram(this.faceProgram);
     gl.deleteFramebuffer(this.maskFramebuffer);
-    gl.deleteFramebuffer(this.blurFramebuffer);
-    gl.deleteFramebuffer(this.lightFramebuffer);
+    gl.deleteFramebuffer(this.downsampleFramebuffer);
     gl.deleteTexture(this.videoTexture);
     gl.deleteTexture(this.backgroundTexture);
+    gl.deleteTexture(this.blurSourceTexture);
     gl.deleteTexture(this.maskCurrentTex);
     gl.deleteTexture(this.maskPreviousTex);
     gl.deleteTexture(this.maskSmoothTex);
     gl.deleteTexture(this.maskFeatherTex);
-    gl.deleteTexture(this.blurTexture);
-    gl.deleteTexture(this.lightTexture);
     gl.deleteBuffer(this.vertexBuffer);
     gl.deleteVertexArray(this.vao);
   }
@@ -203,8 +195,8 @@ export class WebGLCompositor {
     gl.bindTexture(gl.TEXTURE_2D, this.maskPreviousTex);
     gl.uniform1i(gl.getUniformLocation(this.temporalProgram, 'u_previousMask'), 1);
 
-    gl.uniform1f(gl.getUniformLocation(this.temporalProgram, 'u_currentWeight'), 0.75);
-    gl.uniform1f(gl.getUniformLocation(this.temporalProgram, 'u_previousWeight'), 0.25);
+    gl.uniform1f(gl.getUniformLocation(this.temporalProgram, 'u_currentWeight'), 0.88);
+    gl.uniform1f(gl.getUniformLocation(this.temporalProgram, 'u_previousWeight'), 0.12);
 
     this.drawFullscreen();
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
@@ -225,16 +217,29 @@ export class WebGLCompositor {
     gl.bindTexture(gl.TEXTURE_2D, this.maskPreviousTex);
     gl.uniform1i(gl.getUniformLocation(this.edgeProgram, 'u_mask'), 0);
     gl.uniform2f(gl.getUniformLocation(this.edgeProgram, 'u_texelSize'), 1 / this.maskWidth, 1 / this.maskHeight);
-    gl.uniform1f(gl.getUniformLocation(this.edgeProgram, 'u_strength'), 2.0);
+    gl.uniform1f(gl.getUniformLocation(this.edgeProgram, 'u_strength'), 2.4);
 
     this.drawFullscreen();
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
   }
 
-  private runBlurPass(effect: VirtualBackgroundEffect, blurStrength: number): void {
+  private runBlurDownsample(): void {
     const gl = this.gl;
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.blurFramebuffer);
-    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.blurTexture, 0);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, this.downsampleFramebuffer);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.blurSourceTexture, 0);
+    gl.viewport(0, 0, this.blurSourceWidth, this.blurSourceHeight);
+    gl.useProgram(this.copyProgram);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, this.videoTexture);
+    gl.uniform1i(gl.getUniformLocation(this.copyProgram, 'u_tex'), 0);
+    gl.uniform1f(gl.getUniformLocation(this.copyProgram, 'u_flipY'), 0.0);
+    this.drawFullscreen();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  }
+
+  private runBlurComposite(effect: VirtualBackgroundEffect, blurStrength: number): void {
+    const gl = this.gl;
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.viewport(0, 0, this.width, this.height);
 
     gl.useProgram(this.blurProgram);
@@ -247,58 +252,20 @@ export class WebGLCompositor {
     gl.activeTexture(gl.TEXTURE2);
     gl.bindTexture(gl.TEXTURE_2D, this.maskFeatherTex);
     gl.uniform1i(gl.getUniformLocation(this.blurProgram, 'u_mask'), 2);
+    gl.activeTexture(gl.TEXTURE3);
+    gl.bindTexture(gl.TEXTURE_2D, this.blurSourceTexture);
+    gl.uniform1i(gl.getUniformLocation(this.blurProgram, 'u_blurSource'), 3);
 
     gl.uniform1f(gl.getUniformLocation(this.blurProgram, 'u_blurRadius'), blurStrength);
     gl.uniform2f(gl.getUniformLocation(this.blurProgram, 'u_texelSize'), 1 / this.width, 1 / this.height);
-    gl.uniform1f(gl.getUniformLocation(this.blurProgram, 'u_useBackgroundImage'), effect === 'image' ? 1.0 : 0.0);
+    gl.uniform2f(gl.getUniformLocation(this.blurProgram, 'u_blurSourceTexelSize'), 1 / this.blurSourceWidth, 1 / this.blurSourceHeight);
+    gl.uniform1f(
+      gl.getUniformLocation(this.blurProgram, 'u_useBackgroundImage'),
+      effect === 'image' && this.hasBackgroundImage ? 1.0 : 0.0,
+    );
     gl.uniform1f(gl.getUniformLocation(this.blurProgram, 'u_bgAspect'), this.backgroundAspect);
     gl.uniform1f(gl.getUniformLocation(this.blurProgram, 'u_canvasAspect'), this.width / this.height);
-
-    this.drawFullscreen();
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-  }
-
-  private runLightWrapping(): void {
-    const gl = this.gl;
-    gl.bindFramebuffer(gl.FRAMEBUFFER, this.lightFramebuffer);
-    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, this.lightTexture, 0);
-    gl.viewport(0, 0, this.width, this.height);
-
-    gl.useProgram(this.lightProgram);
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, this.videoTexture);
-    gl.uniform1i(gl.getUniformLocation(this.lightProgram, 'u_foreground'), 0);
-    gl.activeTexture(gl.TEXTURE1);
-    gl.bindTexture(gl.TEXTURE_2D, this.blurTexture);
-    gl.uniform1i(gl.getUniformLocation(this.lightProgram, 'u_blurred'), 1);
-    gl.activeTexture(gl.TEXTURE2);
-    gl.bindTexture(gl.TEXTURE_2D, this.maskFeatherTex);
-    gl.uniform1i(gl.getUniformLocation(this.lightProgram, 'u_mask'), 2);
-
-    gl.uniform2f(gl.getUniformLocation(this.lightProgram, 'u_texelSize'), 1 / this.width, 1 / this.height);
-    gl.uniform1f(gl.getUniformLocation(this.lightProgram, 'u_wrapStrength'), 0.7);
-
-    this.drawFullscreen();
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-  }
-
-  private runFaceCorrection(): void {
-    const gl = this.gl;
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    gl.viewport(0, 0, this.width, this.height);
-
-    gl.useProgram(this.faceProgram);
-    gl.activeTexture(gl.TEXTURE0);
-    gl.bindTexture(gl.TEXTURE_2D, this.lightTexture);
-    gl.uniform1i(gl.getUniformLocation(this.faceProgram, 'u_input'), 0);
-    gl.activeTexture(gl.TEXTURE1);
-    gl.bindTexture(gl.TEXTURE_2D, this.maskFeatherTex);
-    gl.uniform1i(gl.getUniformLocation(this.faceProgram, 'u_mask'), 1);
-
-    const box = this.faceBox ?? { x0: -1, y0: -1, x1: -1, y1: -1 };
-    gl.uniform4f(gl.getUniformLocation(this.faceProgram, 'u_faceBox'), box.x0, box.y0, box.x1, box.y1);
-    gl.uniform1f(gl.getUniformLocation(this.faceProgram, 'u_exposureBoost'), 0.18);
-    gl.uniform1f(gl.getUniformLocation(this.faceProgram, 'u_whiteBalance'), 0.08);
+    gl.uniform1f(gl.getUniformLocation(this.blurProgram, 'u_flipY'), 1.0);
 
     this.drawFullscreen();
   }

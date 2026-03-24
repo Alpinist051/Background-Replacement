@@ -11,7 +11,7 @@
   "dependencies": {
     "livekit-client": "^2.16.0",
     "@livekit/track-processors": "^0.5.0",
-    "@mediapipe/tasks-vision": "^0.10.0",
+    "@mediapipe/tasks-vision": "0.10.34",
     "@vueuse/core": "^11.0.0",
     "primeicons": "^7.0.0",
     "primevue": "^4.0.0",

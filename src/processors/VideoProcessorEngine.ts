@@ -21,6 +21,7 @@ export interface VideoProcessorTelemetry {
 }
 
 export class VideoProcessorEngine {
+  private static readonly DEBUG = false;
   private worker: Worker | null = null;
   private videoEl: HTMLVideoElement | null = null;
   private canvasEl: HTMLCanvasElement | null = null;
@@ -31,6 +32,11 @@ export class VideoProcessorEngine {
   private pendingBitmap = false;
   private frameId = 0;
   private videoFrameCbHandle: number | null = null;
+  private framePostedLogCount = 0;
+  private frameRenderedLogCount = 0;
+  private noReadyLogCount = 0;
+  private setEffectPostTimeoutId: number | null = null;
+  private pendingSetEffect: { effect: VirtualBackgroundEffect; blurStrength: number } | null = null;
 
   private effect: VirtualBackgroundEffect;
   private blurStrength: number;
@@ -52,6 +58,12 @@ export class VideoProcessorEngine {
     this.effect = initial.effect;
     this.blurStrength = this.clampBlurStrength(initial.blurStrength);
     this.backgroundImage = initial.backgroundImage;
+  }
+
+  private debug(...args: unknown[]): void {
+    if (!VideoProcessorEngine.DEBUG) return;
+    // eslint-disable-next-line no-console
+    console.log('[VBP:main]', ...args);
   }
 
   onTelemetry(listener: (t: VideoProcessorTelemetry) => void): () => void {
@@ -85,6 +97,7 @@ export class VideoProcessorEngine {
     const width = videoEl.videoWidth;
     const height = videoEl.videoHeight;
     if (!width || !height) throw new Error('Video dimensions not available yet');
+    this.debug('start()', { width, height, effect: this.effect, blur: this.blurStrength });
 
     // Ensure output is at original resolution.
     canvasEl.width = width;
@@ -99,10 +112,12 @@ export class VideoProcessorEngine {
     this.worker = new Worker(new URL('../workers/video-processor.worker.ts', import.meta.url), {
       type: 'module',
     });
+    this.debug('worker created');
 
     this.worker.onmessage = (e: MessageEvent<VirtualBackgroundWorkerResponse>) => {
       const msg = e.data;
       if (msg.type === 'ready') {
+        this.debug('worker ready');
         this.ready = true;
         // Push current settings immediately after worker is ready.
         this.postSetEffect();
@@ -114,6 +129,7 @@ export class VideoProcessorEngine {
       }
 
       if (msg.type === 'error') {
+        this.debug('worker error message', msg.message);
         this.ready = false;
         this.pendingBitmap = false;
         this.emitError(msg.message);
@@ -122,6 +138,10 @@ export class VideoProcessorEngine {
 
       if (msg.type === 'frameRendered') {
         this.pendingBitmap = false;
+        if (this.frameRenderedLogCount < 5) {
+          this.frameRenderedLogCount += 1;
+          this.debug('frameRendered', { frameId: msg.frameId, latencyMs: msg.latencyMs });
+        }
 
         const nowMs = performance.now();
         const sample = this.fpsCounter.tick(nowMs);
@@ -135,6 +155,7 @@ export class VideoProcessorEngine {
     };
 
     this.worker.onerror = () => {
+      this.debug('worker onerror');
       this.pendingBitmap = false;
       this.ready = false;
       this.emitError('Video processor worker crashed');
@@ -150,14 +171,21 @@ export class VideoProcessorEngine {
 
     // Transfer OffscreenCanvas to the worker.
     this.worker.postMessage(initMsg, [offscreen]);
+    this.debug('init posted to worker');
 
     return this.processedStream;
   }
 
   stop(): void {
+    this.debug('stop()');
     this.running = false;
     this.ready = false;
     this.pendingBitmap = false;
+    this.pendingSetEffect = null;
+    if (this.setEffectPostTimeoutId !== null) {
+      window.clearTimeout(this.setEffectPostTimeoutId);
+      this.setEffectPostTimeoutId = null;
+    }
 
     if (this.videoEl && this.videoFrameCbHandle !== null) {
       try {
@@ -210,17 +238,34 @@ export class VideoProcessorEngine {
   }
 
   private emitError(message: string): void {
+    this.debug('emitError()', message);
     for (const l of this.errorListeners) l(message);
   }
 
   private postSetEffect(): void {
     if (!this.worker) return;
-    const msg: VirtualBackgroundWorkerMessage = {
-      type: 'setEffect',
+    this.pendingSetEffect = {
       effect: this.effect,
       blurStrength: this.blurStrength,
     };
-    this.worker.postMessage(msg);
+
+    if (this.setEffectPostTimeoutId !== null) return;
+
+    // Coalesce rapid slider changes into a single post per frame-ish tick.
+    this.setEffectPostTimeoutId = window.setTimeout(() => {
+      this.setEffectPostTimeoutId = null;
+      const worker = this.worker;
+      const pending = this.pendingSetEffect;
+      this.pendingSetEffect = null;
+      if (!worker || !pending) return;
+      const msg: VirtualBackgroundWorkerMessage = {
+        type: 'setEffect',
+        effect: pending.effect,
+        blurStrength: pending.blurStrength,
+      };
+      worker.postMessage(msg);
+      this.debug('setEffect posted', msg);
+    }, 16);
   }
 
   private async postBackgroundImageFromAsset(asset: BackgroundImageAsset): Promise<void> {
@@ -233,12 +278,25 @@ export class VideoProcessorEngine {
     img.src = asset.objectUrl;
     await img.decode();
 
-    const bitmap = await createImageBitmap(img);
+    const targetWidth = Math.max(2, canvasEl.width);
+    const targetHeight = Math.max(2, canvasEl.height);
+    let bitmap: ImageBitmap;
+    try {
+      bitmap = await createImageBitmap(img, {
+        resizeWidth: targetWidth,
+        resizeHeight: targetHeight,
+        resizeQuality: 'high',
+      });
+    } catch {
+      // Fallback for environments that do not support resize options.
+      bitmap = await createImageBitmap(img);
+    }
     const msg: VirtualBackgroundWorkerMessage = {
       type: 'setBackgroundImage',
       bitmap,
     };
     this.worker.postMessage(msg, [bitmap]);
+    this.debug('background image posted to worker', { name: asset.name });
   }
 
   private getInputTrackFrameRate(videoEl: HTMLVideoElement): number | null {
@@ -268,7 +326,13 @@ export class VideoProcessorEngine {
         return;
       }
 
-      if (!this.ready) return;
+      if (!this.ready) {
+        if (this.noReadyLogCount < 3) {
+          this.noReadyLogCount += 1;
+          this.debug('tick skipped: worker not ready yet');
+        }
+        return;
+      }
       if (this.pendingBitmap) return;
 
       const startTimeMs = Number.isFinite(metadata.mediaTime)
@@ -292,6 +356,10 @@ export class VideoProcessorEngine {
             timestampMs: startTimeMs,
           };
           this.worker.postMessage(msg, [bitmap]);
+          if (this.framePostedLogCount < 5) {
+            this.framePostedLogCount += 1;
+            this.debug('frame posted', { frameId, timestampMs: startTimeMs });
+          }
         })
         .catch((err: unknown) => {
           this.pendingBitmap = false;

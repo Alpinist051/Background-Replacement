@@ -11,15 +11,21 @@ uniform sampler2D u_mask;
 uniform vec4 u_faceBox; // x0, y0, x1, y1 in normalized coords; negative width disables correction
 uniform float u_exposureBoost;
 uniform float u_whiteBalance;
+uniform float u_flipY; // 1.0 to flip vertically for canvas presentation
 
 float maskAlpha(vec2 uv) {
   return texture(u_mask, uv).r;
 }
 
 void main() {
-  vec4 color = texture(u_input, v_uv);
-  float alpha = maskAlpha(v_uv);
-  vec2 uvFace = v_uv;
+  vec2 uv = v_uv;
+  if (u_flipY > 0.5) {
+    uv.y = 1.0 - uv.y;
+  }
+
+  vec4 color = texture(u_input, uv);
+  float alpha = maskAlpha(uv);
+  vec2 uvFace = uv;
   if (u_faceBox.z > u_faceBox.x && u_faceBox.w > u_faceBox.y) {
     if (uvFace.x >= u_faceBox.x && uvFace.x <= u_faceBox.z && uvFace.y >= u_faceBox.y && uvFace.y <= u_faceBox.w) {
       float exposure = clamp(u_exposureBoost * alpha, 0.0, 0.25);

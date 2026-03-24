@@ -6,6 +6,10 @@ export interface UseWebcamStreamOptions {
   height?: number;
   frameRate?: number;
   /**
+   * Optional minimum frame rate hint for negotiation fallback.
+   */
+  frameRateMin?: number;
+  /**
    * When provided, always request this device.
    * When omitted, uses default device selection.
    */
@@ -50,7 +54,11 @@ function buildConstraints(options: UseWebcamStreamOptions): MediaStreamConstrain
     videoConstraints.height = { ideal: options.height };
   }
   if (options.frameRate) {
-    videoConstraints.frameRate = { ideal: options.frameRate };
+    if (options.frameRateMin) {
+      videoConstraints.frameRate = { ideal: options.frameRate, min: options.frameRateMin };
+    } else {
+      videoConstraints.frameRate = { ideal: options.frameRate };
+    }
   }
 
   // If deviceId is provided, prefer exact match.
@@ -64,6 +72,56 @@ function buildConstraints(options: UseWebcamStreamOptions): MediaStreamConstrain
   };
 
   return constraints;
+}
+
+function getTrackFrameRate(stream: MediaStream): number | null {
+  const track = stream.getVideoTracks()[0];
+  if (!track) return null;
+  const rate = track.getSettings().frameRate;
+  if (!rate || !Number.isFinite(rate)) return null;
+  return rate;
+}
+
+async function getUserMediaWithAdaptiveFallback(
+  baseOptions: UseWebcamStreamOptions,
+  minAcceptableFps = 24,
+): Promise<MediaStream> {
+  const targetFps = baseOptions.frameRate ?? 30;
+  const width = baseOptions.width ?? 1280;
+  const height = baseOptions.height ?? 720;
+  const profiles: Array<{ scale: number; fps: number; minFps: number }> = [
+    { scale: 1.0, fps: targetFps, minFps: Math.min(minAcceptableFps, targetFps) },
+    { scale: 0.75, fps: targetFps, minFps: Math.min(20, targetFps) },
+    { scale: 0.5, fps: targetFps, minFps: Math.min(15, targetFps) },
+    { scale: 0.5, fps: Math.min(targetFps, 24), minFps: 10 },
+  ];
+
+  let lastError: unknown = null;
+  for (let i = 0; i < profiles.length; i++) {
+    const p = profiles[i]!;
+    const attempt: UseWebcamStreamOptions = {
+      ...baseOptions,
+      width: Math.max(320, Math.round(width * p.scale)),
+      height: Math.max(240, Math.round(height * p.scale)),
+      frameRate: p.fps,
+      frameRateMin: p.minFps,
+    };
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia(buildConstraints(attempt));
+      const actualFps = getTrackFrameRate(stream);
+      const isLast = i === profiles.length - 1;
+      if (actualFps === null || actualFps >= minAcceptableFps || isLast) {
+        return stream;
+      }
+      stopMediaStream(stream);
+    } catch (err: unknown) {
+      lastError = err;
+    }
+  }
+
+  if (lastError) throw lastError;
+  throw new Error('Unable to acquire webcam stream');
 }
 
 export function useWebcamStream(initialOptions?: UseWebcamStreamOptions): UseWebcamStreamResult {
@@ -103,13 +161,17 @@ export function useWebcamStream(initialOptions?: UseWebcamStreamOptions): UseWeb
         ...options,
       };
 
-      const constraints = buildConstraints(merged);
-
-      const nextStream = await navigator.mediaDevices.getUserMedia(constraints);
+      const nextStream = await getUserMediaWithAdaptiveFallback(merged);
       stream.value = nextStream;
 
       const videoTrack = nextStream.getVideoTracks()[0];
       if (videoTrack) {
+        // Hint browser pipeline for low-latency camera processing.
+        try {
+          videoTrack.contentHint = 'motion';
+        } catch {
+          // Ignore unsupported contentHint.
+        }
         activeDeviceId.value = videoTrack.getSettings().deviceId ?? null;
       }
 

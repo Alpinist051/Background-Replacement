@@ -166,6 +166,7 @@
                   </div>
                   <div class="relative">
                     <canvas
+                      :key="processedCanvasRenderKey"
                       ref="processedCanvasRef"
                       class="w-full bg-black object-contain"
                       :style="videoAspectStyle"
@@ -250,6 +251,7 @@ const getSelectedBackgroundAsset = (): BackgroundImageAsset | null => {
 
 const originalVideoRef = ref<HTMLVideoElement | null>(null);
 const processedCanvasRef = ref<HTMLCanvasElement | null>(null);
+const processedCanvasRenderKey = ref<number>(0);
 
 const webcam = useWebcamStream({
   facingMode: 'user',
@@ -385,8 +387,7 @@ async function stopEngine(): Promise<void> {
 
 async function startEngine(): Promise<void> {
   const video = originalVideoRef.value;
-  const canvas = processedCanvasRef.value;
-  if (!video || !canvas) return;
+  if (!video) return;
 
   if (engineStarting) return;
   engineStarting = true;
@@ -398,6 +399,11 @@ async function startEngine(): Promise<void> {
 
   try {
     await stopEngine();
+    // OffscreenCanvas transfer is one-way. Re-mount a fresh canvas before every start.
+    processedCanvasRenderKey.value += 1;
+    await nextTick();
+    const canvas = processedCanvasRef.value;
+    if (!canvas) return;
 
     const selectedAsset = effect.value === 'image' ? getSelectedBackgroundAsset() : null;
     const engine = new VideoProcessorEngine({
